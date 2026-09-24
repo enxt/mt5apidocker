@@ -1,0 +1,13 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+data
+**/__pycache__
+**/.pytest_cache
+api/.venv
+api/logs
+api/mt5_api
+README.md
+config

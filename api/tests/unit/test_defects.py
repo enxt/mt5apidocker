@@ -1,0 +1,344 @@
+"""Three defects found while writing a client against this API.
+
+Each of these is written to fail against the code as it was, so that the fix
+is demonstrated rather than asserted.
+"""
+
+from __future__ import annotations
+
+import fake_mt5
+
+
+def test_positions_can_be_filtered_by_magic(app_client, terminal):
+    """`positions_get` does not take a `magic` keyword, and never has.
+
+    It filters by `symbol`, `group` or `ticket`. Passing `magic` to the real
+    package raises, so `GET /positions/?magic=...` — the call any bot makes to
+    find *its own* trades — failed outright. The fake refuses the same keyword,
+    which is what makes this test able to catch it.
+    """
+    terminal.positions = [
+        fake_mt5.position(ticket=1, magic=777701),
+        fake_mt5.position(ticket=2, magic=0),
+        fake_mt5.position(ticket=3, magic=777701),
+    ]
+    response = app_client.get("/api/v1/positions/", params={"magic": 777701})
+    assert response.status_code == 200
+    tickets = sorted(row["ticket"] for row in response.json())
+    assert tickets == [1, 3]
+
+
+def test_positions_without_a_magic_returns_everything(app_client, terminal):
+    terminal.positions = [
+        fake_mt5.position(ticket=1, magic=777701),
+        fake_mt5.position(ticket=2, magic=0),
+    ]
+    response = app_client.get("/api/v1/positions/")
+    assert response.status_code == 200
+    assert len(response.json()) == 2
+
+
+def test_a_stop_can_be_moved_by_ticket(app_client, terminal):
+    """Trailing a stop needs the position's ticket and nothing else.
+
+    The only route for this took a `trade_id` — a row in this service's own
+    database — and looked the ticket up from it. A position opened by anything
+    other than this service therefore could not have its stop moved at all,
+    which is every position after a redeploy, and every one placed by a bot
+    that talks to `/trading/order` without recording the row it got back.
+    """
+    terminal.positions = [fake_mt5.position(ticket=42, magic=777701)]
+    response = app_client.post(
+        "/api/v1/positions/modify",
+        json={"ticket": 42, "sl": 4398.0, "tp": 4410.0},
+    )
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+
+    sent = [call for call in terminal.calls if call[0] == "order_send"]
+    assert sent, "no order was sent to the terminal"
+    request = sent[-1][1][0]
+    assert request["action"] == fake_mt5.TRADE_ACTION_SLTP
+    assert request["position"] == 42
+    assert request["sl"] == 4398.0
+    assert request["tp"] == 4410.0
+
+
+def test_moving_a_stop_on_an_unknown_ticket_is_a_404(app_client, terminal):
+    terminal.positions = []
+    response = app_client.post(
+        "/api/v1/positions/modify", json={"ticket": 999, "sl": 1.0}
+    )
+    assert response.status_code in (400, 404)
+
+
+def test_the_recorded_leverage_is_the_accounts_not_a_constant(app_client, terminal):
+    """It was hardcoded to 500, so every stored trade's capital was wrong.
+
+    `capital` is `notional / leverage`, and it is what the row reports as the
+    money the trade tied up. On this account — leverage 200 — the constant
+    understated it by a factor of two and a half, silently, in the table
+    somebody would later use to work out what the strategy cost to run.
+    """
+    response = app_client.post(
+        "/api/v1/trading/order",
+        json={"symbol": "XAUUSD", "volume": 0.05, "order_type": "BUY", "sl": 4395.0},
+    )
+    assert response.status_code == 201
+    trade = response.json()["trade"]
+    assert trade["leverage"] == fake_mt5.account().leverage
+
+
+def test_an_order_returns_the_tickets_and_the_retcode(app_client, terminal):
+    """The response has to carry what the terminal said, and it did not.
+
+    `POST /trading/order` returned `{"success": true, "trade": <row>}` and threw
+    the MT5 result away — no ticket, no retcode, no fill price — so a client had
+    to infer the position it had just opened from the database row's
+    `transaction_broker_id`.
+
+    Worse, the row itself serialised to `{}`. The route declares no
+    `response_model`, and a SQLModel table instance encoded without one comes
+    back empty on the versions this project installs (nothing here is pinned).
+    So the response was `{"success": true, "trade": {}}` and a caller learned
+    nothing at all about the order it had just placed.
+    """
+    terminal.next_result = fake_mt5.order_result(order=98765, price=4400.75)
+    response = app_client.post(
+        "/api/v1/trading/order",
+        json={"symbol": "XAUUSD", "volume": 0.05, "order_type": "BUY", "sl": 4395.0},
+    )
+    assert response.status_code == 201
+    body = response.json()
+
+    assert body["result"]["order"] == 98765
+    assert body["result"]["retcode"] == fake_mt5.TRADE_RETCODE_DONE
+    assert body["result"]["price"] == 4400.75
+
+    assert body["trade"], "the trade row serialised to nothing"
+    assert body["trade"]["symbol"] == "XAUUSD"
+    assert body["trade"]["transaction_broker_id"] == "98765"
+
+
+def test_a_rejected_login_does_not_restart_the_server():
+    """Found against a live Deriv demo, and it cost an hour to see.
+
+    MT5's own log said `'6258778': authorization on Deriv-Demo failed (Invalid
+    account)` — a precise, actionable answer. What the HTTP client got was
+    `connection reset by peer` on every MT5-backed route, because the connector
+    treated *any* initialisation failure as a wedged IPC pipe, called
+    `os._exit(1)` mid-response, and let supervisor restart it. Round and round,
+    with the real reason only ever written to a file inside the container.
+
+    A restart cures a broken pipe. It cannot cure a wrong password.
+    """
+    from app.services.connector import restart_helps
+
+    # Worth restarting for: the pipe really may be wedged.
+    assert restart_helps(-10005)  # RES_E_INTERNAL_FAIL_CONNECT
+    assert restart_helps(-10006)  # RES_E_INTERNAL_FAIL_TIMEOUT
+    assert restart_helps(-1)      # generic failure
+
+    # Not worth restarting for: identical outcome next time round.
+    assert not restart_helps(-6)  # authorization failed
+    assert not restart_helps(-8)  # algo trading disabled
+    assert not restart_helps(-5)  # invalid version
+    assert not restart_helps(-2)  # invalid params
+
+
+def test_the_terminals_refusal_reaches_the_caller(app_client, terminal, monkeypatch):
+    """A 503 naming the reason beats a socket that closes."""
+    from app.services import connector
+
+    import time as clock
+
+    monkeypatch.setattr(connector.mt5_connector, "_initialized", False)
+    monkeypatch.setattr(
+        connector.mt5_connector, "_last_error", (-6, "Terminal: Authorization failed")
+    )
+    # A refusal is only quoted back while it is fresh — see
+    # `test_a_refusal_is_not_believed_forever`.
+    monkeypatch.setattr(connector.mt5_connector, "_last_error_at", clock.monotonic())
+    response = app_client.get("/api/v1/positions/")
+    assert response.status_code == 503
+    detail = response.json().get("detail") or response.text
+    assert "Authorization failed" in str(detail)
+    assert "MT5_LOGIN" in str(detail)
+
+
+def test_the_filling_mode_comes_from_the_symbol_not_the_caller():
+    """Deriv allows FOK only, and a caller asking for IOC had every order refused.
+
+    `Unsupported filling mode` (10030) reads like a bad order and is really a
+    bad constant. Measured against a live Deriv demo: BTCUSD, XAUUSD and EURUSD
+    all report `filling_mode=1` — FOK only — while the obvious default to send
+    is IOC.
+    """
+    from app.services.trade import resolve_filling
+
+    FOK, IOC, RETURN = fake_mt5.ORDER_FILLING_FOK, fake_mt5.ORDER_FILLING_IOC, fake_mt5.ORDER_FILLING_RETURN
+
+    # FOK-only, as Deriv reports: the request is overridden.
+    assert resolve_filling("IOC", 1) == FOK
+    assert resolve_filling("FOK", 1) == FOK
+
+    # IOC-only: likewise the other way.
+    assert resolve_filling("FOK", 2) == IOC
+    assert resolve_filling("IOC", 2) == IOC
+
+    # Both allowed: the request is honoured.
+    assert resolve_filling("IOC", 3) == IOC
+    assert resolve_filling("FOK", 3) == FOK
+
+    # Neither flagged: RETURN is the only thing left to try.
+    assert resolve_filling("IOC", 4) == RETURN
+
+    # The terminal said nothing, so do not second-guess the caller.
+    assert resolve_filling("IOC", 0) == IOC
+
+
+def test_an_order_uses_the_resolved_filling_mode(app_client, terminal):
+    """End to end: the request that reaches the terminal carries FOK."""
+    terminal.symbols["XAUUSD"] = fake_mt5.symbol("XAUUSD", filling_mode=1)
+    response = app_client.post(
+        "/api/v1/trading/order",
+        json={"symbol": "XAUUSD", "volume": 0.01, "order_type": "BUY",
+              "sl": 4395.0, "type_filling": "IOC"},
+    )
+    assert response.status_code == 201
+    sent = [c for c in terminal.calls if c[0] == "order_send"][-1][1][0]
+    assert sent["type_filling"] == fake_mt5.ORDER_FILLING_FOK
+
+
+def test_a_refusal_is_not_believed_forever(monkeypatch):
+    """Otherwise fixing the login in the GUI needs a container restart to notice.
+
+    The first version of this fix latched: once a fatal error was recorded the
+    connector reported it on every request for the life of the process. That
+    replaced one unrecoverable state (a restart loop) with another (a permanent
+    refusal), and the operator's obvious next move — fixing the credentials in
+    the terminal — would have appeared to do nothing.
+    """
+    import time as clock
+
+    from app.services import connector
+    from app.utils.exceptions import MT5ConnectionError
+
+    conn = connector.MT5Connector()
+    monkeypatch.setattr(conn, "_login_ready", lambda: True)
+    conn._last_error = (-6, "Terminal: Authorization failed")
+    conn._last_error_at = clock.monotonic()
+
+    # Straight after the refusal, it is quoted back.
+    try:
+        conn.initialize()
+    except MT5ConnectionError as exc:
+        assert "Authorization failed" in str(exc)
+    else:
+        raise AssertionError("expected the refusal to be reported")
+
+    # A minute later the terminal is asked again rather than assumed broken.
+    conn._last_error_at = clock.monotonic() - connector.FATAL_RETRY_AFTER - 1
+    monkeypatch.setattr(conn, "_start_init", lambda: None)
+    try:
+        conn.initialize()
+    except MT5ConnectionError as exc:
+        assert "Authorization failed" not in str(exc)
+        assert conn._last_error is None
+
+
+# --------------------------------------------- the 2026-09-12 nine-hour outage
+
+
+def test_the_launcher_does_not_spawn_a_second_terminal():
+    """MT5 refuses a second instance on the same portable data directory and
+    exits 0 at once, which the loop read as a clean shutdown: **11,945 restarts
+    over eighteen hours**, about eleven a minute, replacing the terminal every five
+    seconds."""
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[3] / "docker" / "run-mt5.sh"
+    text = source.read_text()
+    assert "terminal_running()" in text, "the launcher must be able to see an existing terminal"
+    assert "pgrep -f 'terminal64.exe'" in text
+    # The guard has to come before the launch, not only after it.
+    before = text.split("echo \"Launching MetaTrader 5...\"")[0]
+    assert "if terminal_running; then" in before
+
+
+def test_a_quiet_market_is_an_empty_list_not_a_crash(app_client, terminal):
+    """`copy_rates_*` returning an empty array is normal - a closed session, a
+    window with no bars in it - and the routes turned it into a 500.
+
+    `pd.DataFrame([])` has no `time` column, so `df['time'] = ...` raises
+    `KeyError` two lines later. The integration tests never caught it because
+    they run against a live terminal that always has bars.
+    """
+    terminal.rates = []
+    for route, params in (
+        ("/api/v1/symbols/rates/pos", {"symbol": "XAUUSD", "timeframe": "H1", "num_bars": 10}),
+        (
+            "/api/v1/symbols/rates/from",
+            {"symbol": "XAUUSD", "timeframe": "H1", "date_from": "2026-01-01T00:00:00", "count": 10},
+        ),
+        (
+            "/api/v1/symbols/rates/range",
+            {
+                "symbol": "XAUUSD",
+                "timeframe": "H1",
+                "start": "2026-01-01T00:00:00",
+                "end": "2026-01-02T00:00:00",
+            },
+        ),
+    ):
+        response = app_client.get(route, params=params)
+        assert response.status_code == 200, (route, response.status_code, response.text[:200])
+        assert response.json() == [], route
+
+
+def test_a_terminal_failure_does_not_masquerade_as_a_missing_symbol(app_client, terminal):
+    """**The defect that cost the most.** When MT5 fails, `copy_rates_*` returns
+    `None`, and every route turned that into `404 "No rate data found"` - the same
+    answer a symbol that does not exist gets.
+
+    A client asking for more bars than the terminal can marshal therefore reads
+    "this symbol has no data". That is exactly what happened: a request for
+    400,000 bars 404d, and the client reported all 722 symbols as absent.
+
+    The status must say the request failed, and the body must carry MT5's own
+    error so the cause is visible.
+    """
+    terminal.rates = None
+    terminal.error = (-10004, "IPC recv failed")
+    response = app_client.get(
+        "/api/v1/symbols/rates/pos",
+        params={"symbol": "XAUUSD", "timeframe": "H1", "num_bars": 400_000},
+    )
+    assert response.status_code != 404, "an MT5 failure is not a missing symbol"
+    assert response.status_code >= 500
+    detail = str(response.json())
+    assert "IPC recv failed" in detail or "-10004" in detail, detail
+
+
+def test_the_count_reaches_the_terminal_unchanged(app_client, terminal):
+    """`rates/from` was accused here of ignoring its `count`. It does not.
+
+    It counts *backward* from `date_from`, mirroring MQL5's `CopyRates`, so
+    asking from the very start of history correctly yields one bar - which reads
+    like a broken count and is not one. This pins the pass-through so the
+    accusation cannot be made again without evidence.
+    """
+    terminal.rates = [fake_mt5.bar(when=1_700_000_000 + i * 3600) for i in range(5)]
+    response = app_client.get(
+        "/api/v1/symbols/rates/from",
+        params={
+            "symbol": "XAUUSD",
+            "timeframe": "H1",
+            "date_from": "2026-01-01T00:00:00",
+            "count": 3000,
+        },
+    )
+    assert response.status_code == 200, response.text[:200]
+    sent = [c for c in terminal.calls if c[0] == "copy_rates_from"]
+    assert sent, terminal.calls
+    assert sent[-1][1][-1] == 3000, f"count arrived as {sent[-1][1][-1]}"

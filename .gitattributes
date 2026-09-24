@@ -1,0 +1,4 @@
+# Everything here runs inside a Linux container. A Windows checkout with
+# core.autocrlf would otherwise turn the scripts into CRLF and break them
+# ("/bin/bash^M: bad interpreter").
+* text=auto eol=lf

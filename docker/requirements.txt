@@ -1,0 +1,9 @@
+# Pins for the image, installed together with api/requirements.txt into the
+# Windows Python under Wine. api/requirements.txt leaves these unpinned so the
+# unit tests can run on a modern CPython.
+#
+# MetaTrader5 is deliberately not here: it has to match the terminal build,
+# and mt5setup.exe always installs the newest terminal, so the Dockerfile
+# installs the newest MetaTrader5 in the same step as the terminal.
+numpy==1.22.4  # 1.22 fixes CVE-2021-34141; 1.24+ drops aliases pandas 1.4 uses
+pandas==1.4.1

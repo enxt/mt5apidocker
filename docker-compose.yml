@@ -1,0 +1,41 @@
+# `docker compose up -d --build` builds the image locally.
+# To run the one CI publishes instead, set MT5_IMAGE in .env (for example
+# ghcr.io/<owner>/mt5api:latest) and use `docker compose pull && docker compose up -d`.
+services:
+  mt5api:
+    image: ${MT5_IMAGE:-mt5api:local}
+    build: .
+    # MetaTrader 5 is an x86-64 Windows program; there is no ARM build of this.
+    platform: linux/amd64
+    # Loopback only: the API and the VNC viewer are reachable from this machine
+    # and not from the network. Remove "127.0.0.1:" to expose them, and put
+    # something with TLS in front first - the API can place orders.
+    ports:
+      - "127.0.0.1:6901:6901"   # noVNC: http://localhost:6901
+      - "127.0.0.1:8000:8000"   # API:   http://localhost:8000/docs
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      MT5_API_PORT: 8000
+    volumes:
+      # The API's SQLite database (trades it has recorded). A named volume
+      # rather than a host folder: SQLite locking is unreliable on Windows
+      # bind mounts.
+      - mt5-data:/app/mt5_api/data
+      # Your own files for the terminal, kept out of the image so the image
+      # stays broker-neutral: put your broker's servers.dat in ./config and it
+      # is copied into the terminal on every start. See the README.
+      - ./config:/config:ro
+    restart: unless-stopped
+    # Wine needs more shared memory than Docker's 64 MB default.
+    shm_size: 512m
+    deploy:
+      resources:
+        limits:
+          # The terminal caches MT5_MAX_BARS bars per chart and a deep history
+          # request marshals every bar through Python; 1G is not enough.
+          memory: 4G
+
+volumes:
+  mt5-data:
