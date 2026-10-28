@@ -46,7 +46,13 @@ jobs:
   build:
     name: Build, test & publish
     needs: unit
-    runs-on: ubuntu-latest
+    # ubuntu-latest moved to Ubuntu 26.04 in October 2026, which ships Docker
+    # 29.4.2: its default seccomp profile blocks socket syscalls Wine needs,
+    # so `docker run` fails with "wine: socket : Function not implemented".
+    # BuildKit is not affected, which is why the image builds and only the
+    # smoke test fails. 24.04 has Docker 28.0.4. Move back to ubuntu-latest
+    # once the 26.04 image ships Docker >= 29.4.3, where this is fixed.
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
       contents: read
@@ -105,6 +111,7 @@ jobs:
       # API's imports - everything short of a broker login.
       - name: Smoke test
         run: |
+          echo "Docker server: $(docker version --format '{{.Server.Version}}')"
           docker run -d --name smoke --shm-size 512m -p 8000:8000 -e VNC_PASSWORD=ci mt5api:ci
           for i in $(seq 1 72); do
             if curl -fsS http://localhost:8000/health; then
@@ -113,6 +120,13 @@ jobs:
             fi
             if [ "$(docker inspect -f '{{.State.Running}}' smoke)" != "true" ]; then
               echo "container exited"; break
+            fi
+            # Docker 29.4.2's default seccomp profile breaks Wine instantly;
+            # fail now with the reason instead of waiting out the timeout.
+            if docker logs smoke 2>&1 | grep -q 'wine: socket : Function not implemented'; then
+              echo "::error::Wine cannot create sockets. This is the Docker 29.4.2 seccomp regression; use Docker >= 29.4.3."
+              docker logs smoke 2>&1 | tail -50
+              exit 1
             fi
             sleep 5
           done

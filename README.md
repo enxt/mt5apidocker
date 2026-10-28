@@ -258,6 +258,25 @@ cannot set headers on a WebSocket handshake.
 La capa de MT5 se cachea por semana ISO, así que los push de una misma semana
 reutilizan el terminal ya descargado.
 
+El job de build está fijado a `ubuntu-24.04` a propósito. El runner
+`ubuntu-latest` pasó a Ubuntu 26.04 con Docker 29.4.2, cuya política seccomp
+por defecto rompe Wine al arrancar (ver “Solución de problemas”).
+
+## Solución de problemas
+
+### `wine: socket : Function not implemented`
+
+El terminal no arranca y el contenedor se reinicia en bucle. Es una regresión
+de **Docker 29.4.2**: su perfil seccomp por defecto bloquea llamadas de socket
+que Wine necesita (`AF_ALG` y la ruta `socketcall` de 32 bits). Está corregida
+en **Docker 29.4.3**.
+
+Actualiza Docker a 29.4.3 o superior. Si no puedes, ejecuta el contenedor con
+un perfil seccomp que permita esas llamadas; como último recurso,
+`--security-opt seccomp=unconfined` lo desactiva por completo. El workflow fija
+el job de build a `ubuntu-24.04` (Docker 28.0.4) mientras el runner de Ubuntu
+26.04 no actualice Docker.
+
 ## Tests
 
 ```bash
